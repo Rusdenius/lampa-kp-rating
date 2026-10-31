@@ -1,5 +1,5 @@
 /**
- * Lampa плагин «Кинопоиск рейтинг» v1.5.1
+ * Lampa плагин «Кинопоиск рейтинг» v1.6.0
  * Заменяет рейтинг TMDB на карточках рейтингом Кинопоиска.
  *
  * ВАЖНО (v1.3.0): в реальном клиенте Lampa (3.4.4) событие request_secuses
@@ -29,13 +29,15 @@
  * (показывается сразу из кеша, свежее значение подставляется по приходу ответа).
  * Ошибки сети/сервиса не считаются «не найдено»: кеш не портится, символ «–» не ставится,
  * повтор поиска произойдёт при следующем просмотре.
+ * Большие списки: запросы к API пускаются с интервалом (анти-лимит Кинопоиска);
+ * отказ сервера (429/graphql) даёт временную паузу с авто-возобновлением, а не блокировку навсегда.
  * Страница фильма: если включено, ставится нативный бейдж «KP» (поле kp_rating)
  * из кеша — обычно рейтинги на странице фильма уже показывает другой плагин.
  */
 (function (global) {
   'use strict';
 
-  var VERSION = '1.5.1';
+  var VERSION = '1.6.0';
 
   var CACHE_PREFIX = 'kpr13_';
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
@@ -43,6 +45,9 @@
   var REFRESH_AFTER = 60 * 60 * 24 * 3; // 3 дня — фоновое обновление найденного
   var MAX_PARALLEL = 3;
   var REQUEST_TIMEOUT = 8000;
+  var PACE_MS = 200;        // минимальный интервал между стартами запросов (анти-лимит)
+  var PAUSE_GQL = 10 * 60;  // сек: сервер отклонил graphql (allow-list/лимит)
+  var PAUSE_429 = 60;       // сек: HTTP 429 — сервер просил сбавить темп
 
   var SRC = {
     kp: 'kinopoisk.ru',
@@ -68,7 +73,7 @@
   var active = 0;
   var paused = false;      // пауза после 401/402 (ключевые API)
   var warned = false;      // «нет ключа» показано один раз
-  var gqlBlocked = false; // сервер отклонил запрос (allow-list сменился)
+  var pausedUntil = 0;     // пауза до (мс): сервер отклонил graphql / HTTP 429 — временно
   var netWarned = false; // «нет ответа kinopoisk.ru» показано один раз
   var fullMarks = typeof WeakSet == 'function' ? new WeakSet() : null;
 
@@ -213,14 +218,18 @@
     pump();
   }
 
+  var lastStart = 0;
   function pump() {
+    // темп: не пускаем запросы чаще PACE_MS — большой список не должен
+    // упираться в анти-бот лимиты Кинопоиска
     while (active < MAX_PARALLEL && queue.length) {
+      var wait = lastStart + PACE_MS - Date.now();
+      if (wait > 0) { setTimeout(pump, wait + 5); return; }
+      lastStart = Date.now();
       var task = queue.shift();
       active++;
-      task(function () {
-        active--;
-        pump();
-      });
+      try { task(function () { active--; pump(); }); }
+      catch (e) { active--; pump(); } // задача не должна останавливать очередь
     }
   }
 
@@ -309,18 +318,27 @@
     var title = titleOf(item);
     if (!title) return done(0);
     var src = source();
+    if (Date.now() < pausedUntil) return done(undefined); // временная пауза сервера
 
     if (src == SRC.kp) {
-      if (gqlBlocked) return done(undefined); // сервис недоступен — не «не найдено»
       net(GQL_URL, {
         method: 'POST',
         body: JSON.stringify({ operationName: 'SuggestSearch', variables: { keyword: title, limit: 20 }, query: GQL_QUERY }),
         headers: { 'Content-Type': 'application/json', 'service-id': '25' }
       }, function (data, err) {
         if (err || !data || data.errors) {
-          if (data && data.errors && !gqlBlocked) {
-            gqlBlocked = true;
-            try { Lampa().Noty.show('Плагин «Кинопоиск»: сервис отклонил запрос — обновите плагин'); } catch (e) {}
+          if (data && data.errors) {
+            // сервер отклонил graphql: ограничение/allow-list — пауза, не «навсегда»
+            var was = Date.now() < pausedUntil;
+            pausedUntil = Date.now() + PAUSE_GQL * 1000;
+            if (!was) {
+              try { Lampa().Noty.show('Плагин «Кинопоиск»: сервис просит сбавить темп — пауза 10 минут'); } catch (e) {}
+            }
+          } else if (err && (err.status == 429 || err.status == 403)) {
+            if (Date.now() >= pausedUntil) {
+              pausedUntil = Date.now() + PAUSE_429 * 1000;
+              try { Lampa().Noty.show('Плагин «Кинопоиск»: ограничение запросов (429) — пауза на минуту'); } catch (e) {}
+            }
           }
           if (err && !data && !netWarned) {
             netWarned = true; // сеть не дошла (мост/таймаут) — видимая диагностика
@@ -688,7 +706,7 @@
       component: 'kpr',
       param: { name: KEY.source, type: 'select', values: [SRC.kp, SRC.kpu, SRC.kpd], 'default': SRC.kp },
       field: { name: 'Источник API' },
-      onChange: function () { gqlBlocked = false; }
+      onChange: function () { pausedUntil = 0; }
     });
 
     S.addParam({
