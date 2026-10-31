@@ -1,5 +1,5 @@
 /**
- * Lampa плагин «Кинопоиск рейтинг» v1.6.0
+ * Lampa плагин «Кинопоиск рейтинг» v1.7.0
  * Заменяет рейтинг TMDB на карточках рейтингом Кинопоиска.
  *
  * ВАЖНО (v1.3.0): в реальном клиенте Lampa (3.4.4) событие request_secuses
@@ -31,15 +31,19 @@
  * повтор поиска произойдёт при следующем просмотре.
  * Большие списки: запросы к API пускаются с интервалом (анти-лимит Кинопоиска);
  * отказ сервера (429/graphql) даёт временную паузу с авто-возобновлением, а не блокировку навсегда.
+ * Общая база по годам (GitHub Pages): каталог Кинопоиска обходится Actions раз в неделю;
+ * файл года грузится один раз за сессию — большинство рейтингов выдаётся мгновенно и без
+ * запросов к Кинопоиску. База авторитетна: её значение перезаписывает прежние (в т.ч.
+ * ошибочные). v1.7 сменил префикс кеша и вычищает старые записи kpr13_*.
  * Страница фильма: если включено, ставится нативный бейдж «KP» (поле kp_rating)
  * из кеша — обычно рейтинги на странице фильма уже показывает другой плагин.
  */
 (function (global) {
   'use strict';
 
-  var VERSION = '1.6.0';
+  var VERSION = '1.7.0';
 
-  var CACHE_PREFIX = 'kpr13_';
+  var CACHE_PREFIX = 'kpr14_'; // v1.7: сменили префикс — старые (бывали ошибочные) записи не читаем
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
   var CACHE_TTL_NEG = 60 * 60 * 24;     // сутки для «не найдено»
   var REFRESH_AFTER = 60 * 60 * 24 * 3; // 3 дня — фоновое обновление найденного
@@ -48,6 +52,7 @@
   var PACE_MS = 200;        // минимальный интервал между стартами запросов (анти-лимит)
   var PAUSE_GQL = 10 * 60;  // сек: сервер отклонил graphql (allow-list/лимит)
   var PAUSE_429 = 60;       // сек: HTTP 429 — сервер просил сбавить темп
+  var DB_BASE = 'https://rusdenius.github.io/lampa-kp-rating/data/';
 
   var SRC = {
     kp: 'kinopoisk.ru',
@@ -60,8 +65,12 @@
     replace: 'kpr_replace',
     in_full: 'kpr_in_full',
     colors: 'kpr_colors',
+    snapshot: 'kpr_snapshot',
     debug: 'kpr_debug'
   };
+
+  // общий кеш рейтингов: обновляется GitHub Actions раз в неделю, лежит рядом с плагином
+  // (DB_BASE объявлен в константах выше)
 
   var GQL_URL = 'https://graphql.kinopoisk.ru/graphql';
   // Точный текст запроса SuggestSearch (allow-list сервера требует байт-в-байт).
@@ -462,6 +471,121 @@
     }
   }
 
+  /* ================= общая база рейтингов (по годам, GitHub Pages) ================= */
+
+  // База: data/<год>.json с манифестом. Ключ в файле — нормализованное название
+  // (то же norm(), что и в плагине). Запись: [рейтинг, idКП, тип(0=фильм), жанры, страны].
+  // Файл года грузится один раз за сессию — дальше рейтинг берётся мгновенно и без
+  // запросов к Кинопоиску. Промах по базе (нет названия/года) — обычный путь: suggest.
+  // База авторитетна: найденное ею значение перезаписывает прежние (в т.ч. ошибочные).
+
+  var DB_MANIFEST_TTL = 60 * 60 * 24 * 7; // сек — манифест перечитывается раз в неделю
+  var DB_FAIL_PAUSE = 60 * 10;            // сек — пауза между неудачными попытками базы
+  var dbManifest = null;    // {v, u, years:{...}} | 'load' | null
+  var dbFailAt = 0;         // когда база последний раз ошиблась
+  var dbYears = {};         // год -> f-объект | 'load' | undefined
+  var dbWanted = {};        // год -> true, файл уже запрошен, манифеста ещё нет
+
+  function dbOn() { return field(KEY.snapshot, true); }
+
+  function dbManifestFresh() {
+    try {
+      var raw = global.localStorage.getItem(CACHE_PREFIX + 'dbman');
+      if (!raw) return null;
+      var m = JSON.parse(raw);
+      if (!m || !m.years) return null;
+      if (Date.now() - (m.t || 0) > DB_MANIFEST_TTL * 1000) return null;
+      return m;
+    } catch (e) { return null; }
+  }
+
+  function dbLoadManifest() {
+    if (dbManifest) return;
+    var cached = dbManifestFresh();
+    if (cached) { dbManifest = cached; return; }
+    if (dbManifest === 'load') return;
+    if (Date.now() - dbFailAt < DB_FAIL_PAUSE * 1000) return;
+    dbManifest = 'load';
+    net(DB_BASE + 'manifest.json', {}, function (data, err) {
+      if (err || !data || !data.years) {
+        dbManifest = null;
+        dbFailAt = Date.now();
+        dbg('db manifest fail', (err && err.status) || 'no data');
+        return;
+      }
+      dbFailAt = 0;
+      dbManifest = data;
+      try {
+        global.localStorage.setItem(CACHE_PREFIX + 'dbman',
+          JSON.stringify({ t: Date.now(), v: data.v || 1, years: data.years }));
+      } catch (e) {}
+      dbg('db manifest ok, годов:', data.years ? Object.keys(data.years).length : 0);
+      // годы, запрошенные до манифеста, могли не стартовать — повторим
+      for (var y in dbWanted) dbEnsureYear(parseInt(y, 10) || 0);
+    });
+  }
+
+  function dbEnsureYear(year) {
+    if (!dbOn() || !year) return;
+    dbLoadManifest();
+    if (dbManifest && dbManifest !== 'load' && !dbManifest.years[year]) return; // года нет в базе
+    dbWanted[year] = true;
+    if (dbYears[year]) return;
+    if (dbYears[year] === 'load') return;
+    if (Date.now() - dbFailAt < DB_FAIL_PAUSE * 1000) return;
+    dbYears[year] = 'load';
+    net(DB_BASE + year + '.json', {}, function (data, err) {
+      if (err && err.status == 404) {
+        dbYears[year] = 'none'; // года нет в базе — больше не спрашиваем
+        dbg('db year absent', year);
+        return;
+      }
+      if (err || !data || !data.f || typeof data.f != 'object') {
+        dbYears[year] = undefined;
+        dbFailAt = Date.now(); // база недоступна — не спамим повторами
+        dbg('db year fail', year, (err && err.status) || 'no data');
+        return;
+      }
+      delete dbWanted[year];
+      dbYears[year] = data.f;
+      dbg('db year ok', year, Object.keys(data.f).length);
+      dbApply(year);
+    });
+  }
+
+  // применить файл года ко всем фильмам этого года в реестре (и кеше)
+  function dbApply(year) {
+    var f = dbYears[year];
+    if (!f || f === 'load') return;
+    var n = 0;
+    for (var k in regById) {
+      var e = regById[k];
+      if (!e || e.year != year) continue;
+      var rec = f[norm(e.title)];
+      if (!rec) continue;
+      var r = rec[0];
+      if (r > 0) { e.r = r; e.v = 0; e.done = true; }
+      else { e.r = 0; e.done = true; } // в каталоге есть, рейтинга нет — подтверждённое «–»
+      var idKey = keyOfId(e.id);
+      if (regByKey[idKey]) cacheSet(idKey, { r: r, v: 0, t: Date.now() });
+      var tKey = keyOfTitle(e.title, e.year);
+      if (regByKey[tKey]) cacheSet(tKey, { r: r, v: 0, t: Date.now() });
+      n++;
+    }
+    dbg('db apply', year, n);
+    if (n) patchCards();
+  }
+
+  // синхронный ответ из базы: {hit:true, r:<число>} | null (файла нет/не готов/промах)
+  function dbSync(title, year) {
+    if (!dbOn() || !year) return null;
+    dbEnsureYear(year);
+    var f = dbYears[year];
+    if (!f || f === 'load' || f === 'none') return null; // файла нет/не готов — обычный путь
+    var rec = f[norm(title)];
+    return rec ? { hit: true, r: rec[0] } : null;
+  }
+
   /* ================= хук ответов (до отрисовки) ================= */
 
   function onSecuses(e) {
@@ -497,7 +621,25 @@
         var en = regEntry(item.id, title, year);
         var key = keyOfId(item.id);
         if (regByKey[key] != en) regByKey[key] = en;
+        // общая база по годам: мгновенный ответ без запроса к Кинопоиску
+        var db = dbSync(title, year);
+        if (db && db.hit) {
+          en.r = db.r; en.v = 0; en.done = true;
+          applyItem(item, db.r);
+          cacheSet(key, { r: db.r, v: 0, t: Date.now() });
+          return;
+        }
         var c = cacheGet(key);
+        if (!c) {
+          // нет по id — проверяем локальный кеш по названию и году
+          var tkey = keyOfTitle(title, year);
+          var ct = cacheGet(tkey);
+          if (ct) {
+            // переносим под id-ключ, чтобы дальше работали периодические обновления
+            cacheSet(key, { r: ct.r, v: ct.v || 0, t: ct.t || Date.now() });
+            c = ct;
+          }
+        }
         if (c) {
           en.r = c.r; en.v = c.v || 0; en.done = true;
           applyItem(item, c.r);
@@ -647,7 +789,13 @@
               var c = cacheGet(key);
               var e2 = regEntry('dom:' + key, title, year);
               regByKey[key] = e2;
-              if (c) {
+              // база по годам: мгновенный ответ без запроса к Кинопоиску
+              var db = dbSync(title, year);
+              if (db && db.hit) {
+                e2.r = db.r; e2.v = 0; e2.done = true;
+                cacheSet(key, { r: db.r, v: 0, t: Date.now() });
+                patchCard(node);
+              } else if (c) {
                 e2.r = c.r; e2.v = c.v || 0; e2.done = true;
                 patchCard(node);
               } else {
@@ -736,6 +884,12 @@
 
     S.addParam({
       component: 'kpr',
+      param: { name: KEY.snapshot, type: 'trigger', 'default': true },
+      field: { name: 'Общая база рейтингов по годам (GitHub)' }
+    });
+
+    S.addParam({
+      component: 'kpr',
       param: { name: KEY.debug, type: 'trigger', 'default': false },
       field: { name: 'Отладка (лог в консоль)' }
     });
@@ -776,9 +930,24 @@
 
   /* ================= запуск ================= */
 
+  // v1.7: смена префикса кеша (kpr13_ -> kpr14_) — старые записи, где бывали
+  // ошибочные рейтинги, вычищаем полностью
+  function purgeLegacy() {
+    try {
+      var kill = [];
+      for (var i = 0; i < global.localStorage.length; i++) {
+        var k = global.localStorage.key(i);
+        if (k && (k.indexOf('kpr13_') == 0 || k.indexOf('kpr13_snap') == 0)) kill.push(k);
+      }
+      kill.forEach(function (k) { global.localStorage.removeItem(k); });
+      if (kill.length) dbg('legacy purged:', kill.length);
+    } catch (e) {}
+  }
+
   function init() {
     if (!global.Lampa || !global.Lampa.Listener) return;
     manifest();
+    try { purgeLegacy(); } catch (e) {}
     try { settings(); } catch (e) {}
     global.Lampa.Listener.follow('request_secuses', onSecuses);
     try {
