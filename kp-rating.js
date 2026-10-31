@@ -1,5 +1,5 @@
 /**
- * Lampa плагин «Кинопоиск рейтинг» v1.5.0
+ * Lampa плагин «Кинопоиск рейтинг» v1.5.1
  * Заменяет рейтинг TMDB на карточках рейтингом Кинопоиска.
  *
  * ВАЖНО (v1.3.0): в реальном клиенте Lampa (3.4.4) событие request_secuses
@@ -27,13 +27,15 @@
  * Если фильма нет в Кинопоиске — на бейдже показывается символ «–» вместо рейтинга TMDB.
  * Периодическое обновление: найденные значения старше 3 дней тихо перезапрашиваются в фоне
  * (показывается сразу из кеша, свежее значение подставляется по приходу ответа).
+ * Ошибки сети/сервиса не считаются «не найдено»: кеш не портится, символ «–» не ставится,
+ * повтор поиска произойдёт при следующем просмотре.
  * Страница фильма: если включено, ставится нативный бейдж «KP» (поле kp_rating)
  * из кеша — обычно рейтинги на странице фильма уже показывает другой плагин.
  */
 (function (global) {
   'use strict';
 
-  var VERSION = '1.5.0';
+  var VERSION = '1.5.1';
 
   var CACHE_PREFIX = 'kpr13_';
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
@@ -309,7 +311,7 @@
     var src = source();
 
     if (src == SRC.kp) {
-      if (gqlBlocked) return done(0);
+      if (gqlBlocked) return done(undefined); // сервис недоступен — не «не найдено»
       net(GQL_URL, {
         method: 'POST',
         body: JSON.stringify({ operationName: 'SuggestSearch', variables: { keyword: title, limit: 20 }, query: GQL_QUERY }),
@@ -325,7 +327,7 @@
             try { Lampa().Noty.show('Плагин «Кинопоиск»: нет ответа kinopoisk.ru (код ' + ((err && err.status) || 0) + ')'); } catch (e) {}
           }
           dbg('gql fail', (err && err.status) || 'errors', title);
-          return done(0);
+          return done(undefined); // ошибка сети ≠ «не найдено»: кеш и бейдж не трогаем
         }
         var top = (data.data && data.data.suggest && data.data.suggest.top) || {};
         var cands = [];
@@ -341,6 +343,7 @@
       net('https://api.poiskkino.dev/v1.4/movie/search?limit=10&page=1&query=' + encodeURIComponent(title),
         { headers: { 'X-API-KEY': field(KEY.key, '') } },
         function (data, err) {
+          if (err || !data) return done(undefined); // ошибка сети ≠ «не найдено»
           var cands = [];
           ((data && data.docs) || []).forEach(function (d) {
             cands.push({ item: item, film: { nameRu: d.name, nameEn: d.alternativeName, year: d.year }, rating: d.rating && (d.rating.kp || d.rating.kinopoisk), votes: d.rating && (d.rating.kpVote || d.rating.kinopoiskVoteCount), active: true });
@@ -351,6 +354,7 @@
       net('https://kinopoiskapiunofficial.tech/api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(title),
         { headers: { 'X-API-KEY': field(KEY.key, '') } },
         function (data, err) {
+          if (err || !data) return done(undefined); // ошибка сети ≠ «не найдено»
           var cands = [];
           var films = (data && data.films) || (data && data.searchFilms && data.searchFilms.films) || [];
           films.forEach(function (f) {
@@ -380,7 +384,9 @@
     fetchAndStore(item, key);
   }
 
-  // фоновый поиск + сохранение в кеш; по завершении допатчиваем DOM
+  // фоновый поиск + сохранение в кеш; по завершении допатчиваем DOM.
+  // done(rating): rating>0 — найдено; 0 — подтверждённо не найдено (символ «–»);
+  // undefined — ошибка сети/сервиса: кеш не портим, бейдж не трогаем, повторим позже.
   function fetchAndStore(item, key) {
     if (inflight[key]) return;
     inflight[key] = true;
@@ -388,11 +394,27 @@
     enqueue(function (next) {
       kpRating(item, function (rating, votes) {
         delete inflight[key];
+        if (rating === undefined || rating === null) {
+          dbg('skip (error)', key, 'кеш и бейдж не тронуты');
+          next();
+          return;
+        }
+        if (rating === 0) {
+          var prev = cacheGet(key);
+          if (prev && prev.r > 0) {
+            // раньше рейтинг был найден, теперь «пусто» — вероятен ложный пропуск
+            // (suggest отдал пустой ответ). Хорошую запись не затираем, «–» не ставим;
+            // старый t сохранён — обновление повторится при следующем просмотре.
+            dbg('keep previous rating', key, prev.r);
+            next();
+            return;
+          }
+        }
         cacheSet(key, { r: rating || 0, v: votes || 0, t: Date.now() });
         var e = regByKey[key];
         if (e) { e.r = rating || 0; e.v = votes || 0; e.done = true; }
         dbg('done', key, rating);
-        patchCards(); // и найденное (число), и «не найдено» (символ «–»)
+        patchCards(); // и найденное (число), и подтверждённое «не найдено» (символ «–»)
         next();
       });
     });
