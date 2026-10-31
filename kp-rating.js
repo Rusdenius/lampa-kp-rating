@@ -1,5 +1,5 @@
 /**
- * Lampa плагин «Кинопоиск рейтинг» v1.7.0
+ * Lampa плагин «Кинопоиск рейтинг» v1.7.1
  * Заменяет рейтинг TMDB на карточках рейтингом Кинопоиска.
  *
  * ВАЖНО (v1.3.0): в реальном клиенте Lampa (3.4.4) событие request_secuses
@@ -41,7 +41,7 @@
 (function (global) {
   'use strict';
 
-  var VERSION = '1.7.0';
+  var VERSION = '1.7.1';
 
   var CACHE_PREFIX = 'kpr14_'; // v1.7: сменили префикс — старые (бывали ошибочные) записи не читаем
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
@@ -199,7 +199,14 @@
     var A = Lampa() && Lampa().Android;
     if (A && typeof A.httpReq == 'function' && global.AndroidJS) {
       dbg('net native', params.post_data ? 'POST' : 'GET', url);
-      A.httpReq(params, call);
+      try {
+        A.httpReq(params, call);
+      } catch (e) {
+        // сбой моста не должен ломать общий конвейер (например GET на 404)
+        dbg('net native throw', url, (e && e.message) || e);
+        clearTimeout(timer);
+        fin(null, { status: 0 });
+      }
       return;
     }
 
@@ -622,7 +629,8 @@
         var key = keyOfId(item.id);
         if (regByKey[key] != en) regByKey[key] = en;
         // общая база по годам: мгновенный ответ без запроса к Кинопоиску
-        var db = dbSync(title, year);
+        var db = null;
+        try { db = dbSync(title, year); } catch (e) { dbg('db sync err', (e && e.message) || e); }
         if (db && db.hit) {
           en.r = db.r; en.v = 0; en.done = true;
           applyItem(item, db.r);
@@ -790,7 +798,8 @@
               var e2 = regEntry('dom:' + key, title, year);
               regByKey[key] = e2;
               // база по годам: мгновенный ответ без запроса к Кинопоиску
-              var db = dbSync(title, year);
+              var db = null;
+              try { db = dbSync(title, year); } catch (e) { dbg('db sync err', (e && e.message) || e); }
               if (db && db.hit) {
                 e2.r = db.r; e2.v = 0; e2.done = true;
                 cacheSet(key, { r: db.r, v: 0, t: Date.now() });

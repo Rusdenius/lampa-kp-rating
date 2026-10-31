@@ -33,8 +33,8 @@ HDRS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
 }
-WORKERS = 3
-SLEEP = (0.5, 0.9)          # пауза между страницами одного воркера, с
+WORKERS = 1
+SLEEP = (2.0, 4.0)          # пауза между страницами одного воркера, с — бережём API (плагин на ТВ ходит тем же IP)
 PAGE_LIMIT = 50
 YEAR_MIN, YEAR_MAX = 1890, 2029
 
@@ -147,9 +147,12 @@ def crawl_year(year):
     with open(jsonl_path(year), 'a', encoding='utf-8') as out:
         while True:
             page = fetch_page(year, offset)
-            m = (page.get('data') or {}).get('movieListBySlug', {}).get('movies') or {}
-            total = m.get('total') or 0
-            items = m.get('items') or []
+            if not isinstance(page, dict):
+                raise YearFailed('сервер вернул не-JSON (offset=%d)' % offset)
+            m = (page.get('data') or {}).get('movieListBySlug') or {}
+            movies = m.get('movies') or {}
+            total = movies.get('total') or 0
+            items = movies.get('items') or []
             if total == 0:
                 meta.update({'done': True, 'total': 0, 'next_offset': 0})
                 save_meta(year, meta)
