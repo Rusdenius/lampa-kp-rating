@@ -1,5 +1,5 @@
 /**
- * Lampa плагин «Кинопоиск рейтинг» v1.4.0
+ * Lampa плагин «Кинопоиск рейтинг» v1.5.0
  * Заменяет рейтинг TMDB на карточках рейтингом Кинопоиска.
  *
  * ВАЖНО (v1.3.0): в реальном клиенте Lampa (3.4.4) событие request_secuses
@@ -23,18 +23,22 @@
  * Сеть: на Android-приложении — нативный мост Android.httpReq (без CORS),
  * в браузере — $.ajax (graphql на чужом Origin получит 403, используйте keyed-API).
  *
- * Цвета как на Кинопоиске: 7 и выше — зелёный (#3cbb5f), ниже 7 — светло-серый (#9e9e9e).
+ * Цвета как на Кинопоиске: 7 и выше — зелёный (#3cbb5f), ниже 7 — светло-серый (#cfcfcf).
+ * Если фильма нет в Кинопоиске — на бейдже показывается символ «–» вместо рейтинга TMDB.
+ * Периодическое обновление: найденные значения старше 3 дней тихо перезапрашиваются в фоне
+ * (показывается сразу из кеша, свежее значение подставляется по приходу ответа).
  * Страница фильма: если включено, ставится нативный бейдж «KP» (поле kp_rating)
  * из кеша — обычно рейтинги на странице фильма уже показывает другой плагин.
  */
 (function (global) {
   'use strict';
 
-  var VERSION = '1.4.0';
+  var VERSION = '1.5.0';
 
   var CACHE_PREFIX = 'kpr13_';
-  var CACHE_TTL = 60 * 60 * 24 * 14; // 14 дней
-  var CACHE_TTL_NEG = 60 * 60 * 24;  // сутки для «не найдено»
+  var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
+  var CACHE_TTL_NEG = 60 * 60 * 24;     // сутки для «не найдено»
+  var REFRESH_AFTER = 60 * 60 * 24 * 3; // 3 дня — фоновое обновление найденного
   var MAX_PARALLEL = 3;
   var REQUEST_TIMEOUT = 8000;
 
@@ -225,7 +229,7 @@
       var raw = global.localStorage.getItem(CACHE_PREFIX + key);
       if (!raw) return null;
       var c = JSON.parse(raw);
-      var ttl = c.r > 0 ? CACHE_TTL : CACHE_TTL_NEG;
+      var ttl = (c.r > 0 ? CACHE_TTL : CACHE_TTL_NEG) * 1000; // сек -> мс
       if (!c.t || Date.now() - c.t > ttl) return null;
       return c;
     } catch (e) { return null; }
@@ -368,18 +372,27 @@
     if (c) {
       if (e) { e.r = c.r; e.v = c.v || 0; e.done = true; }
       dbg('cache hit', key, c.r);
-      if (c.r > 0) patchCards();
+      patchCards();
+      // периодическое обновление: запись старше REFRESH_AFTER — обновим в фоне
+      if (c.t && c.r > 0 && Date.now() - c.t > REFRESH_AFTER * 1000) fetchAndStore(item, key);
       return;
     }
+    fetchAndStore(item, key);
+  }
+
+  // фоновый поиск + сохранение в кеш; по завершении допатчиваем DOM
+  function fetchAndStore(item, key) {
+    if (inflight[key]) return;
     inflight[key] = true;
     dbg('fetch', key, item.title);
     enqueue(function (next) {
       kpRating(item, function (rating, votes) {
         delete inflight[key];
         cacheSet(key, { r: rating || 0, v: votes || 0, t: Date.now() });
+        var e = regByKey[key];
         if (e) { e.r = rating || 0; e.v = votes || 0; e.done = true; }
         dbg('done', key, rating);
-        if (rating > 0) patchCards();
+        patchCards(); // и найденное (число), и «не найдено» (символ «–»)
         next();
       });
     });
@@ -448,6 +461,10 @@
         if (c) {
           en.r = c.r; en.v = c.v || 0; en.done = true;
           applyItem(item, c.r);
+          // периодическое обновление: запись старше REFRESH_AFTER — тихо перезапросить
+          if (c.r > 0 && c.t && Date.now() - c.t > REFRESH_AFTER * 1000) {
+            fetchAndStore({ id: item.id, title: title, year: year }, key);
+          }
         } else {
           // карточки без кеша: фоновый поиск; когда придёт ответ — допатчим DOM
           lookup({ id: item.id, title: title, year: year }, key);
@@ -461,7 +478,8 @@
   /* ================= цвета (палитра Кинопоиска) ================= */
 
   var KP_GREEN = '#3cbb5f'; // зелёный Кинопоиска
-  var KP_GRAY = '#9e9e9e';  // светло-серый
+  var KP_GRAY = '#cfcfcf';  // светло-серый (поднял яркость: прежний #9e9e9e был плохо различим)
+  var KP_NORATING = '–';    // символ «нет рейтинга Кинопоиска»
 
   function colorsOn() { return field(KEY.colors, true); }
 
@@ -518,7 +536,8 @@
 
   // допатчить уже отрисованную карточку: текст бейджа + цвет;
   // если бейджа нет (у фильма не было рейтинга TMDB) — создаём его сами,
-  // ровно как нативный рендер: <div class="card__vote"> внутри .card__view
+  // ровно как нативный рендер: <div class="card__vote"> внутри .card__view.
+  // Если фильм в Кинопоиске не найден — вместо рейтинга TMDB показываем символ «–».
   function patchCard(card) {
     try {
       var badge = card.querySelector('.card__view .card__vote') || card.querySelector('.card__vote');
@@ -541,6 +560,14 @@
         }
         colorize(badge);
         return true;
+      }
+      if (en && en.done && badge) {
+        // поиск завершён, рейтинга Кинопоиска нет — символ вместо рейтинга TMDB
+        if ((badge.innerText || badge.textContent) != KP_NORATING) {
+          badge.innerText = KP_NORATING;
+          badge.classList.remove('kpr-v-green', 'kpr-v-gray');
+        }
+        return false;
       }
       if (badge) colorize(badge);
       return false;
