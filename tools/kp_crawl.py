@@ -33,8 +33,8 @@ HDRS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
 }
-WORKERS = 1
-SLEEP = (2.0, 4.0)          # пауза между страницами одного воркера, с — бережём API (плагин на ТВ ходит тем же IP)
+WORKERS = 6
+SLEEP = (0.3, 0.6)          # пауза между страницами одного воркера, с — максимум (429 => авто-бэкофф)
 PAGE_LIMIT = 50
 YEAR_MIN, YEAR_MAX = 1890, 2029
 
@@ -137,8 +137,12 @@ def parse_item(it, filter_year):
     return [kid, ru, en, r, typ, gids, cids, yr]
 
 
-def crawl_year(year):
+def crawl_year(year, refresh=False):
     meta = load_meta(year)
+    if refresh:
+        meta = {'done': False, 'next_offset': 0, 'total': None}
+        open(jsonl_path(year), 'w', encoding='utf-8').close()  # с нуля
+        save_meta(year, meta)
     if meta.get('done'):
         return None
     offset = int(meta.get('next_offset', 0))
@@ -174,7 +178,7 @@ def crawl_year(year):
     return total
 
 
-def worker(q, failed, lock):
+def worker(q, failed, lock, refresh=False):
     while True:
         try:
             year = q.get_nowait()
@@ -182,7 +186,7 @@ def worker(q, failed, lock):
             return
         try:
             t0 = time.time()
-            total = crawl_year(year)
+            total = crawl_year(year, refresh)
             if total is not None:
                 with lock:
                     print('== %d: %s позиций за %.0f с' %
@@ -198,14 +202,18 @@ def worker(q, failed, lock):
 def main():
     os.makedirs(STATE, exist_ok=True)
     os.makedirs(DATA, exist_ok=True)
+    refresh = '--refresh' in sys.argv
     years = list(range(YEAR_MAX, YEAR_MIN - 1, -1))
+    for a in sys.argv:
+        if a.startswith('--years='):
+            years = sorted((int(x) for x in a.split('=', 1)[1].split(',') if x.strip()), reverse=True)
     q = queue.Queue()
     for y in years:
         q.put(y)
     failed = []
     lock = threading.Lock()
     t0 = time.time()
-    threads = [threading.Thread(target=worker, args=(q, failed, lock)) for _ in range(WORKERS)]
+    threads = [threading.Thread(target=worker, args=(q, failed, lock, refresh)) for _ in range(WORKERS)]
     for t in threads:
         t.start()
     for t in threads:
