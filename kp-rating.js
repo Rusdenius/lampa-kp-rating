@@ -24,6 +24,8 @@
  * в браузере — $.ajax (graphql на чужом Origin получит 403, используйте keyed-API).
  *
  * Цвета как на Кинопоиске: 7 и выше — зелёный (#3cbb5f), ниже 7 — светло-серый (#cfcfcf).
+ * Окрашивается ТОЛЬКО подставленный рейтинг Кинопоиска (бейдж помечается data-kpr);
+ * исходные числа TMDB на непатченных карточках не перекрашиваются.
  * Если фильма нет в Кинопоиске — на бейдже показывается символ «–» вместо рейтинга TMDB.
  * Периодическое обновление: найденные значения старше 3 дней тихо перезапрашиваются в фоне
  * (показывается сразу из кеша, свежее значение подставляется по приходу ответа).
@@ -46,7 +48,7 @@
 (function (global) {
   'use strict';
 
-  var VERSION = '1.8.0';
+  var VERSION = '1.8.1';
 
   var CACHE_PREFIX = 'kpr15_'; // v1.8: ё→е в нормализации — ключи кеша сменились
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
@@ -715,6 +717,12 @@
     return v >= 10 ? '10' : v.toFixed(1); // как штатный шаблон: cap 10, одна десятая
   }
 
+  // бейдж, заполненный нами рейтингом Кинопоиска (data-kpr): окрашиваем только такие —
+  // исходные числа TMDB на непатченных карточках остаются в родном цвете
+  function kprMarked(el) {
+    try { return !!(el.getAttribute && el.getAttribute('data-kpr') == '1'); } catch (e) { return false; }
+  }
+
   // данные карточки: сперва card_data (клиент кладёт туда объект фильма —
   // у сериалов .card__title в DOM пуст, клиент пишет только data.title),
   // затем DOM (.card__title + .card__age). Возвращает {title, year, id} | null.
@@ -773,6 +781,7 @@
           badge = document.createElement('div');
           badge.classList.add('card__vote');
           badge.innerText = txt;
+          try { badge.setAttribute('data-kpr', '1'); } catch (e) {}
           view.appendChild(badge);
           colorize(badge);
           return true;
@@ -781,6 +790,7 @@
           badge.innerText = txt;
           badge.classList.remove('kpr-v-green', 'kpr-v-gray');
         }
+        try { badge.setAttribute('data-kpr', '1'); } catch (e) {}
         colorize(badge);
         return true;
       }
@@ -790,9 +800,11 @@
           badge.innerText = KP_NORATING;
           badge.classList.remove('kpr-v-green', 'kpr-v-gray');
         }
+        try { badge.setAttribute('data-kpr', '1'); } catch (e) {}
         return false;
       }
-      if (badge) colorize(badge);
+      // карточка не сматчилась или ответ ещё в пути: на бейдже число TMDB —
+      // текст не трогаем и НЕ окрашиваем (цвет — только рейтингу Кинопоиска)
       return false;
     } catch (e) { return false; }
   }
@@ -824,10 +836,12 @@
       for (var k = 0; k < nested.length; k++) scanCard(nested[k]);
     }
 
-    if (isBadge(node)) colorize(node);
+    // красим только бейджи, которые сами заполнили рейтингом Кинопоиска
+    // (data-kpr): исходные числа TMDB остаются в родном цвете
+    if (isBadge(node) && kprMarked(node)) colorize(node);
     var inner = [];
     try { inner = node.querySelectorAll('.card__vote, .full-start__rate'); } catch (e) {}
-    for (var i = 0; i < inner.length; i++) colorize(inner[i]);
+    for (var i = 0; i < inner.length; i++) if (kprMarked(inner[i])) colorize(inner[i]);
   }
 
   // обработать одну карточку: допатчить бейдж, если рейтинг известен;
