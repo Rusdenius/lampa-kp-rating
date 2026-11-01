@@ -42,13 +42,18 @@
  * вставкой карточек одним узлом («Избранное») и сериалы: данные карточки берём
  * из card_data (у сериалов .card__title в DOM пуст — клиент пишет только title),
  * сменил префикс кеша и вычищает старые записи kpr13_/kpr14_.
+ * v1.8.1: окрашивается ТОЛЬКО рейтинг Кинопоиска (бейдж помечается data-kpr);
+ * v1.8.2: год карточки (дата релиза TMDB) и год в каталоге КП (productionYear)
+ * могут расходиться на ±1 («Грязные деньги» — 2026 на карточке, 2025 в КП) —
+ * база ищет и в соседних файлах года; точное совпадение года приоритетнее,
+ * соседний год отдаёт только позитивный рейтинг (без «–»).
  * Страница фильма: если включено, ставится нативный бейдж «KP» (поле kp_rating)
  * из кеша — обычно рейтинги на странице фильма уже показывает другой плагин.
  */
 (function (global) {
   'use strict';
 
-  var VERSION = '1.8.1';
+  var VERSION = '1.8.2';
 
   var CACHE_PREFIX = 'kpr15_'; // v1.8: ё→е в нормализации — ключи кеша сменились
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
@@ -571,20 +576,43 @@
       dbYears[year] = data.f;
       dbg('db year ok', year, Object.keys(data.f).length);
       dbApply(year);
+      // Если после применения файла года остались нерешённые записи этого года —
+      // возможно, они в соседних файлах (год КП и год карточки сдвинуты на ±1)
+      var open = 0;
+      for (var rk in regById) {
+        var re = regById[rk];
+        if (re && re.year == year && !re.done) open++;
+      }
+      if (open) {
+        dbg('db year open', year, open, '— ask neighbors');
+        dbEnsureYear(year - 1);
+        dbEnsureYear(year + 1);
+      }
     });
   }
 
-  // применить файл года ко всем фильмам этого года в реестре (и кеше)
+  // применить файл года к фильмам этого года (и ±1 — год КП бывает сдвинут
+  // относительно года карточки) в реестре (и кеше). Точное совпадение года
+  // приоритетнее соседнего: если файл года карточки уже ответил этим же
+  // названием — соседний год его не перезаписывает. Соседний год подтверждает
+  // только позитивный рейтинг («–» из соседнего года не ставим).
   function dbApply(year) {
     var f = dbYears[year];
     if (!f || f === 'load') return;
     var n = 0;
     for (var k in regById) {
       var e = regById[k];
-      if (!e || e.year != year) continue;
+      if (!e || !e.year) continue;
+      var dd = Math.abs(e.year - year);
+      if (dd > 1) continue;
       var rec = f[norm(e.title)];
       if (!rec) continue;
       var r = rec[0];
+      if (dd > 0) {
+        if (!(r > 0)) continue; // соседний год — только позитивный рейтинг
+        var fe = dbYears[e.year];
+        if (fe && fe !== 'load' && fe !== 'none' && fe[norm(e.title)]) continue; // точный год уже ответил
+      }
       if (r > 0) { e.r = r; e.v = 0; e.done = true; }
       else { e.r = 0; e.done = true; } // в каталоге есть, рейтинга нет — подтверждённое «–»
       var idKey = keyOfId(e.id);
@@ -598,13 +626,29 @@
   }
 
   // синхронный ответ из базы: {hit:true, r:<число>} | null (файла нет/не готов/промах)
+  // Год карточки (дата релиза TMDB) и год в каталоге КП (productionYear) бывают
+  // сдвинуты на ±1: «Грязные деньги» — 2026 на карточке, 2025 в КП. Suggest такой
+  // сдвиг уже принимает (+2 к score за год ±1) — база делает то же: сперва точный
+  // год, затем соседние. Пока точный файл грузится — по соседним не гадаем;
+  // соседний год отдаёт только позитивный рейтинг.
   function dbSync(title, year) {
     if (!dbOn() || !year) return null;
+    var key = norm(title);
     dbEnsureYear(year);
-    var f = dbYears[year];
-    if (!f || f === 'load' || f === 'none') return null; // файла нет/не готов — обычный путь
-    var rec = f[norm(title)];
-    return rec ? { hit: true, r: rec[0] } : null;
+    var f0 = dbYears[year];
+    if (f0 === 'load') return null; // точный файл в полёте — ждём его, не гадаем
+    if (f0 && f0 !== 'none' && f0[key]) return { hit: true, r: f0[key][0] };
+    var ys = [year - 1, year + 1];
+    for (var i = 0; i < ys.length; i++) {
+      var y = ys[i];
+      if (!y) continue;
+      dbEnsureYear(y);
+      var f = dbYears[y];
+      if (!f || f === 'load' || f === 'none') continue;
+      var rec = f[key];
+      if (rec && rec[0] > 0) return { hit: true, r: rec[0], y: y };
+    }
+    return null;
   }
 
   /* ================= хук ответов (до отрисовки) ================= */
