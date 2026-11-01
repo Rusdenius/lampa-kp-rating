@@ -1,3 +1,4 @@
 crawl_state/
 crawl_run.log
 data/*.jsonl
+tools/__pycache__/

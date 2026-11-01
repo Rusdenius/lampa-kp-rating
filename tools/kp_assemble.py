@@ -16,6 +16,22 @@ from kp_crawl import norm, STATE, DATA
 from datetime import date
 
 
+def better(cur, new):
+    """Коллизия норм-ключа (два разных фильма с одинаковым названием в одном
+    году — например, «Курьер» 2026): приоритет записи с рейтингом КП;
+    0 — «в каталоге есть, рейтинга нет», такую запись вытесняет рейтинг."""
+    if (cur[0] or 0) == 0 and (new[0] or 0) > 0:
+        return new
+    return cur
+
+
+def put(f, key, item):
+    if key in f:
+        f[key] = better(f[key], item)
+    else:
+        f[key] = item
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
     years = {}
@@ -37,10 +53,10 @@ def main():
                 kru = norm(ru) if ru else ''
                 ken = norm(en) if en else ''
                 if kru:
-                    f[kru] = item
+                    put(f, kru, item)
                     n += 1
                 if ken and ken != kru:
-                    f[ken] = item
+                    put(f, ken, item)
         if not f:
             continue
         yf = year  # файл года собираем из записей, отнесённых кроулером к этому году

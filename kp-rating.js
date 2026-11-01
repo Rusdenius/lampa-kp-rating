@@ -1,5 +1,5 @@
 /**
- * Lampa плагин «Кинопоиск рейтинг» v1.7.1
+ * Lampa плагин «Кинопоиск рейтинг» v1.8.0
  * Заменяет рейтинг TMDB на карточках рейтингом Кинопоиска.
  *
  * ВАЖНО (v1.3.0): в реальном клиенте Lampa (3.4.4) событие request_secuses
@@ -35,15 +35,20 @@
  * файл года грузится один раз за сессию — большинство рейтингов выдаётся мгновенно и без
  * запросов к Кинопоиску. База авторитетна: её значение перезаписывает прежние (в т.ч.
  * ошибочные). v1.7 сменил префикс кеша и вычищает старые записи kpr13_*.
+ * v1.8: нормализация ё→е (ключи базы и кеша совпадают с базой в любой раскладке),
+ * разрешение коллизий базы (приоритет записи с рейтингом), экраны с пакетной
+ * вставкой карточек одним узлом («Избранное») и сериалы: данные карточки берём
+ * из card_data (у сериалов .card__title в DOM пуст — клиент пишет только title),
+ * сменил префикс кеша и вычищает старые записи kpr13_/kpr14_.
  * Страница фильма: если включено, ставится нативный бейдж «KP» (поле kp_rating)
  * из кеша — обычно рейтинги на странице фильма уже показывает другой плагин.
  */
 (function (global) {
   'use strict';
 
-  var VERSION = '1.7.1';
+  var VERSION = '1.8.0';
 
-  var CACHE_PREFIX = 'kpr14_'; // v1.7: сменили префикс — старые (бывали ошибочные) записи не читаем
+  var CACHE_PREFIX = 'kpr15_'; // v1.8: ё→е в нормализации — ключи кеша сменились
   var CACHE_TTL = 60 * 60 * 24 * 30;    // 30 дней — абсолютный потолок записи
   var CACHE_TTL_NEG = 60 * 60 * 24;     // сутки для «не найдено»
   var REFRESH_AFTER = 60 * 60 * 24 * 3; // 3 дня — фоновое обновление найденного
@@ -270,6 +275,7 @@
 
   function norm(s) {
     return (s || '').toString().toLowerCase()
+      .replace(/ё/g, 'е') // унификация ё: TMDB пишет «ё», Кинопоиск — как попало
       .replace(/[«»"']/g, '')
       .replace(/[\.,:;!?\(\)\[\]—–\-_/\\]+/g, ' ')
       .replace(/\s+/g, ' ')
@@ -444,6 +450,12 @@
             return;
           }
         }
+        // база авторитетна: если файл года уже загружен и содержит фильм,
+        // её значение важнее ответа suggest (закрывает гонку «suggest затёр базу»)
+        try {
+          var db = dbSync(item.title, item.year);
+          if (db && db.hit) { rating = db.r; votes = 0; }
+        } catch (er) {}
         cacheSet(key, { r: rating || 0, v: votes || 0, t: Date.now() });
         var e = regByKey[key];
         if (e) { e.r = rating || 0; e.v = votes || 0; e.done = true; }
@@ -703,17 +715,38 @@
     return v >= 10 ? '10' : v.toFixed(1); // как штатный шаблон: cap 10, одна десятая
   }
 
-  // сопоставить карточку с фильмом реестра: .card__title + .card__age (год)
-  function resolveCard(card) {
+  // данные карточки: сперва card_data (клиент кладёт туда объект фильма —
+  // у сериалов .card__title в DOM пуст, клиент пишет только data.title),
+  // затем DOM (.card__title + .card__age). Возвращает {title, year, id} | null.
+  function cardInfo(card) {
+    try {
+      var d = card.card_data;
+      if (d && typeof d == 'object') {
+        var t = d.title || d.name || d.original_title || d.original_name || '';
+        var y = parseInt(((d.release_date || d.first_air_date || d.year || '') + '').slice(0, 4), 10) || 0;
+        if (t) return { title: (t + '').trim(), year: y, id: d.id };
+      }
+    } catch (e) {}
     try {
       var tEl = card.querySelector('.card__title');
-      if (!tEl) return null;
-      var title = norm(tEl.textContent);
+      var t = tEl ? (tEl.textContent || '').trim() : '';
+      if (!t) return null;
+      var aEl = card.querySelector('.card__age');
+      var y = parseInt((aEl && aEl.textContent || '0').replace(/\D/g, ''), 10) || 0;
+      return { title: t, year: y, id: null };
+    } catch (e) { return null; }
+  }
+
+  // сопоставить карточку с фильмом реестра: название и год из cardInfo()
+  function resolveCard(card) {
+    try {
+      var info = cardInfo(card);
+      if (!info) return null;
+      var title = norm(info.title);
       if (!title) return null;
       var list = regByTitle[title];
       if (!list || !list.length) return null;
-      var aEl = card.querySelector('.card__age');
-      var year = parseInt((aEl && aEl.textContent || '0').replace(/\D/g, ''), 10) || 0;
+      var year = info.year || 0;
       if (year) {
         var same = [];
         for (var i = 0; i < list.length; i++) if (list[i].year == year) same.push(list[i]);
@@ -781,45 +814,60 @@
     // новые карточки: патчим бейдж, если рейтинг известен; иначе ищем по названию
     var cls = ' ' + (node.className || '') + ' ';
     if (cls.indexOf(' card ') >= 0) {
-      patchCard(node);
-      var en = resolveCard(node);
-      if (!en) {
-        // карточка не из реестра (клиент отдал TMDB-кеш без request_secuses) —
-        // ищем по названию и году прямо из DOM
-        var tEl = node.querySelector('.card__title');
-        if (tEl) {
-          var title = (tEl.textContent || '').trim();
-          if (title) {
-            var aEl = node.querySelector('.card__age');
-            var year = parseInt((aEl && aEl.textContent || '0').replace(/\D/g, ''), 10) || 0;
-            var key = keyOfTitle(title, year);
-            if (!regByKey[key]) {
-              var c = cacheGet(key);
-              var e2 = regEntry('dom:' + key, title, year);
-              regByKey[key] = e2;
-              // база по годам: мгновенный ответ без запроса к Кинопоиску
-              var db = null;
-              try { db = dbSync(title, year); } catch (e) { dbg('db sync err', (e && e.message) || e); }
-              if (db && db.hit) {
-                e2.r = db.r; e2.v = 0; e2.done = true;
-                cacheSet(key, { r: db.r, v: 0, t: Date.now() });
-                patchCard(node);
-              } else if (c) {
-                e2.r = c.r; e2.v = c.v || 0; e2.done = true;
-                patchCard(node);
-              } else {
-                lookup({ id: 'dom:' + key, title: title, year: year }, key);
-              }
-            }
-          }
-        }
-      }
+      scanCard(node);
+    } else {
+      // контейнер с карточками внутри: экраны вроде «Избранного» клиент строит
+      // синхронно и вставляет одним узлом — карточки в мутации по отдельности
+      // не попадают, обходим вложенные сами
+      var nested = [];
+      try { nested = node.querySelectorAll('.card'); } catch (e) {}
+      for (var k = 0; k < nested.length; k++) scanCard(nested[k]);
     }
 
     if (isBadge(node)) colorize(node);
     var inner = [];
     try { inner = node.querySelectorAll('.card__vote, .full-start__rate'); } catch (e) {}
     for (var i = 0; i < inner.length; i++) colorize(inner[i]);
+  }
+
+  // обработать одну карточку: допатчить бейдж, если рейтинг известен;
+  // если карточки нет в реестре — найти по названию и году (card_data либо DOM),
+  // дать мгновенный ответ из базы по годам или запустить поиск в Кинопоиске
+  function scanCard(card) {
+    try {
+      patchCard(card);
+      var en = resolveCard(card);
+      if (en) return;
+      // карточка не из реестра (клиент отдал список из своего кеша — например,
+      // «Избранное» — без request_secuses): ищем сами
+      var info = cardInfo(card);
+      if (!info || !info.title) return;
+      var title = info.title;
+      var year = info.year;
+      var hasId = info.id !== null && info.id !== undefined && info.id !== '';
+      var idKey = hasId ? keyOfId(info.id) : null;
+      var key = keyOfTitle(title, year);
+      if (regByKey[key] || (idKey && regByKey[idKey])) return;
+      var c = idKey ? cacheGet(idKey) : null;
+      if (!c) c = cacheGet(key);
+      var e2 = regEntry(hasId ? info.id : 'dom:' + key, title, year);
+      regByKey[key] = e2;
+      if (idKey) regByKey[idKey] = e2;
+      // база по годам: мгновенный ответ без запроса к Кинопоиску
+      var db = null;
+      try { db = dbSync(title, year); } catch (er) { dbg('db sync err', (er && er.message) || er); }
+      if (db && db.hit) {
+        e2.r = db.r; e2.v = 0; e2.done = true;
+        cacheSet(key, { r: db.r, v: 0, t: Date.now() });
+        if (idKey) cacheSet(idKey, { r: db.r, v: 0, t: Date.now() });
+        patchCard(card);
+      } else if (c) {
+        e2.r = c.r; e2.v = c.v || 0; e2.done = true;
+        patchCard(card);
+      } else {
+        lookup({ id: hasId ? info.id : 'dom:' + key, title: title, year: year }, idKey || key);
+      }
+    } catch (e) {}
   }
 
   function injectCss() {
@@ -939,14 +987,14 @@
 
   /* ================= запуск ================= */
 
-  // v1.7: смена префикса кеша (kpr13_ -> kpr14_) — старые записи, где бывали
-  // ошибочные рейтинги, вычищаем полностью
+  // v1.7: kpr13_* (ошибочные записи), v1.8: kpr14_* (ключи без ё→е-нормализации
+  // и без разрешения коллизий базы) — вычищаем полностью
   function purgeLegacy() {
     try {
       var kill = [];
       for (var i = 0; i < global.localStorage.length; i++) {
         var k = global.localStorage.key(i);
-        if (k && (k.indexOf('kpr13_') == 0 || k.indexOf('kpr13_snap') == 0)) kill.push(k);
+        if (k && (k.indexOf('kpr13_') == 0 || k.indexOf('kpr14_') == 0)) kill.push(k);
       }
       kill.forEach(function (k) { global.localStorage.removeItem(k); });
       if (kill.length) dbg('legacy purged:', kill.length);
